@@ -1,0 +1,66 @@
+name: Update 2026 CFB Rankings
+
+on:
+  schedule:
+    # Run at both possible UTC equivalents of 11 AM Central.
+    # A time check below handles daylight saving time.
+    - cron: "0 16 * * 1"
+    - cron: "0 17 * * 1"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-rankings:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Central time
+        id: central_time
+        run: |
+          CHICAGO_HOUR=$(TZ=America/Chicago date +%H)
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$CHICAGO_HOUR" = "11" ]; then
+            echo "run_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.central_time.outputs.run_update == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.central_time.outputs.run_update == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.central_time.outputs.run_update == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run rankings update
+        if: steps.central_time.outputs.run_update == 'true'
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          CFB_SEASON: "2026"
+        run: python update_rankings.py
+
+      - name: Commit updated rankings
+        if: steps.central_time.outputs.run_update == 'true'
+        run: |
+          git config user.name "CFB Rankings Bot"
+          git config user.email "actions@github.com"
+
+          git add CFB_2026_Final_Rankings.csv
+          git add CFB_2026_CFP_Eligible_Final.csv
+
+          if git diff --cached --quiet; then
+            echo "No ranking changes to commit."
+          else
+            git commit -m "Automatically update 2026 rankings"
+            git push
+          fi

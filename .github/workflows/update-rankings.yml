@@ -46,7 +46,7 @@ jobs:
         if: steps.central_time.outputs.run_update == 'true'
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-          CFB_SEASON: "2026"
+          CFBD_SEASON: "2026"
         run: python update_rankings.py
 
       - name: Commit updated rankings
@@ -55,8 +55,13 @@ jobs:
           git config user.name "CFB Rankings Bot"
           git config user.email "actions@github.com"
 
-          git add CFB_2026_Final_Rankings.csv
-          git add CFB_2026_CFP_Eligible_Final.csv
+          if [ -f "CFB_2026_Final_Rankings.csv" ]; then
+            git add CFB_2026_Final_Rankings.csv
+          fi
+
+          if [ -f "CFB_2026_CFP_Eligible_Final.csv" ]; then
+            git add CFB_2026_CFP_Eligible_Final.csv
+          fi
 
           if git diff --cached --quiet; then
             echo "No ranking changes to commit."

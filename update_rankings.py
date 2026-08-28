@@ -32,7 +32,8 @@ df_games = df_games[df_games["seasonType"] == "regular"].copy()
 if "completed" in df_games.columns:
     df_games = df_games[df_games["completed"] == True].copy()
 if df_games.empty:
-    raise SystemExit(f"No completed {SEASON} regular-season FBS games available yet.")
+    print(f"No completed {SEASON} regular-season FBS games available yet.")
+    raise SystemExit(0)
 
 
 

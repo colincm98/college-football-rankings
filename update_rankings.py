@@ -22,13 +22,18 @@ def fetch_cfbd(endpoint, params):
     with urllib.request.urlopen(request) as response:
         return json.loads(response.read().decode())
 
-# Pull FBS regular-season games
+# Pull all FBS regular-season games.
+# Keep the full schedule for predictions, while rankings use completed games only.
 games = fetch_cfbd("games", {"year": SEASON, "classification": "fbs"})
-df_games = pd.DataFrame(games)
-if df_games.empty:
-    raise SystemExit(f"No {SEASON} games available yet.")
-df_games = df_games[df_games["seasonType"] == "regular"].copy()
+df_all_games = pd.DataFrame(games)
+if df_all_games.empty:
+    print(f"No {SEASON} games available yet.")
+    raise SystemExit(0)
+
+df_all_games = df_all_games[df_all_games["seasonType"] == "regular"].copy()
+
 # Rankings use completed games only; future scheduled games must not count as games played.
+df_games = df_all_games.copy()
 if "completed" in df_games.columns:
     df_games = df_games[df_games["completed"] == True].copy()
 if df_games.empty:
@@ -2499,3 +2504,446 @@ cfp_rankings.to_csv(f"CFB_{SEASON}_CFP_Eligible_Final.csv", index=True, index_la
 print(f"Saved {len(final_rankings)} teams to CFB_{SEASON}_Final_Rankings.csv")
 print(f"Saved {len(cfp_rankings)} CFP-eligible teams to CFB_{SEASON}_CFP_Eligible_Final.csv")
 print(cfp_rankings.head(25).to_string())
+
+# ============================================================
+# GAME PREDICTIONS + PERMANENT MODEL RECORD
+# ============================================================
+# Ranking philosophy and prediction philosophy are intentionally separate:
+# - Rankings above remain 100% based on the current season's resume model.
+# - Predictions use a temporary prior-year strength prior early in the season.
+# - Official picks begin in Week 5.
+# - The preseason prior fades to zero by Week 7, so later predictions are driven
+#   entirely by this season's V16 rating.
+# - Once a game prediction is saved, it is frozen and never recalculated.
+
+PREDICTIONS_FILE = f"CFB_{SEASON}_Predictions.csv"
+PREDICTION_START_WEEK = int(os.getenv("CFB_PREDICTION_START_WEEK", "5"))
+PRIOR_SEASON = SEASON - 1
+
+# Prediction calibration settings. These can be tuned later using the model's
+# own historical prediction results without changing the ranking formula.
+HOME_FIELD_POINTS = float(os.getenv("CFB_HOME_FIELD_POINTS", "2.5"))
+RATING_POINTS_PER_RATING = float(os.getenv("CFB_RATING_POINTS_PER_POINT", "0.30"))
+WIN_PROB_SCALE = float(os.getenv("CFB_WIN_PROB_SCALE", "7.5"))
+
+
+def _safe_bool(value):
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _percentile_map(df, team_col, value_col, higher_is_better=True):
+    """Convert a team metric to a 0-100 percentile-strength lookup."""
+    if df.empty or team_col not in df.columns or value_col not in df.columns:
+        return {}
+
+    temp = df[[team_col, value_col]].copy()
+    temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
+    temp = temp.dropna(subset=[team_col, value_col])
+    if temp.empty:
+        return {}
+
+    # Keep one value per team if an endpoint happens to return duplicates.
+    temp = temp.groupby(team_col, as_index=False)[value_col].last()
+    pct = temp[value_col].rank(pct=True, ascending=higher_is_better) * 100
+    # pandas ascending=True gives smallest value the lowest rank. For a
+    # higher-is-better metric, that is exactly what we want.
+    if not higher_is_better:
+        pct = (1.0 - temp[value_col].rank(pct=True, ascending=True)) * 100
+    return dict(zip(temp[team_col], pct))
+
+
+def _try_fetch_cfbd(endpoint, params):
+    """Prediction-only API calls should not break the ranking update."""
+    try:
+        return fetch_cfbd(endpoint, params)
+    except Exception as exc:
+        print(f"Warning: could not fetch {endpoint}: {exc}")
+        return []
+
+
+def _prior_weight_for_week(week):
+    """Temporary preseason prior; official predictions begin in Week 5."""
+    try:
+        week = int(week)
+    except (TypeError, ValueError):
+        return 0.0
+
+    # By design, the prior is already small when the official record begins.
+    # Week 5: 20% prior / 80% current V16
+    # Week 6: 10% prior / 90% current V16
+    # Week 7+: 0% prior / 100% current V16
+    if week <= 4:
+        return 1.0
+    if week == 5:
+        return 0.20
+    if week == 6:
+        return 0.10
+    return 0.0
+
+
+# ------------------------------------------------------------
+# Build a PRIOR-SEASON preseason strength rating.
+# ------------------------------------------------------------
+# We use objective prior-year information only for predictions:
+#   45% prior-year SP+
+#   35% prior-year Elo
+#   20% our own prior-year final model rating, when that CSV is available.
+# If one component is unavailable for a team, the available weights are
+# automatically re-normalized rather than assigning a fake value.
+
+sp_data = _try_fetch_cfbd("ratings/sp", {"year": PRIOR_SEASON})
+elo_data = _try_fetch_cfbd("ratings/elo", {"year": PRIOR_SEASON})
+
+sp_df = pd.DataFrame(sp_data)
+elo_df = pd.DataFrame(elo_data)
+
+sp_strength = _percentile_map(sp_df, "team", "rating", higher_is_better=True)
+elo_strength = _percentile_map(elo_df, "team", "elo", higher_is_better=True)
+
+# Prefer the full prior-year rankings file, but fall back to the CFP-eligible
+# export because that is the file already used by the website/repository.
+prior_model_candidates = [
+    f"CFB_{PRIOR_SEASON}_Final_Rankings.csv",
+    f"CFB_{PRIOR_SEASON}_CFP_Eligible_Final.csv",
+]
+prior_model_df = pd.DataFrame()
+for prior_file in prior_model_candidates:
+    if os.path.exists(prior_file):
+        try:
+            prior_model_df = pd.read_csv(prior_file)
+            print(f"Loaded prior-year model strength from {prior_file}")
+            break
+        except Exception as exc:
+            print(f"Warning: could not read {prior_file}: {exc}")
+
+prior_model_strength = _percentile_map(
+    prior_model_df,
+    "Team",
+    "Rating",
+    higher_is_better=True,
+)
+
+PRESEASON_COMPONENT_WEIGHTS = {
+    "sp": 0.45,
+    "elo": 0.35,
+    "our_model": 0.20,
+}
+
+all_prior_teams = set(sp_strength) | set(elo_strength) | set(prior_model_strength)
+preseason_strength_lookup = {}
+preseason_source_lookup = {}
+
+for team in all_prior_teams:
+    components = []
+    if team in sp_strength:
+        components.append((sp_strength[team], PRESEASON_COMPONENT_WEIGHTS["sp"], "SP+"))
+    if team in elo_strength:
+        components.append((elo_strength[team], PRESEASON_COMPONENT_WEIGHTS["elo"], "Elo"))
+    if team in prior_model_strength:
+        components.append((prior_model_strength[team], PRESEASON_COMPONENT_WEIGHTS["our_model"], f"Our {PRIOR_SEASON} Model"))
+
+    total_weight = sum(weight for _, weight, _ in components)
+    if total_weight <= 0:
+        continue
+
+    preseason_strength_lookup[team] = sum(
+        value * weight for value, weight, _ in components
+    ) / total_weight
+    preseason_source_lookup[team] = " + ".join(source for _, _, source in components)
+
+print(
+    f"Built preseason prediction strength for {len(preseason_strength_lookup)} teams "
+    f"using {PRIOR_SEASON} data."
+)
+
+
+# ------------------------------------------------------------
+# Blend the preseason prior with THIS season's V16 rating.
+# ------------------------------------------------------------
+current_rating_lookup = final_rankings.set_index("Team")["Rating"].to_dict()
+
+
+def prediction_strength(team, week):
+    """Return blended prediction rating plus its component details."""
+    current = current_rating_lookup.get(team)
+    if current is None or pd.isna(current):
+        return None
+
+    current = float(current)
+    prior = preseason_strength_lookup.get(team)
+    prior_weight = _prior_weight_for_week(week)
+
+    # If no prior-year information exists, use the current model only.
+    if prior is None or pd.isna(prior):
+        prior_weight = 0.0
+        blended = current
+        source = "Current V16 only"
+        prior_value = np.nan
+    else:
+        prior_value = float(prior)
+        blended = prior_weight * prior_value + (1.0 - prior_weight) * current
+        source = preseason_source_lookup.get(team, "Prior-year data")
+
+    return {
+        "current": current,
+        "preseason": prior_value,
+        "preseason_weight": prior_weight,
+        "prediction_rating": float(blended),
+        "prior_source": source,
+    }
+
+
+def projected_game(home_team, away_team, neutral_site, week):
+    """Return projected margin, winner, probability, and rating components."""
+    home = prediction_strength(home_team, week)
+    away = prediction_strength(away_team, week)
+    if home is None or away is None:
+        return None
+
+    rating_edge = home["prediction_rating"] - away["prediction_rating"]
+    hfa = 0.0 if neutral_site else HOME_FIELD_POINTS
+    projected_home_margin = rating_edge * RATING_POINTS_PER_RATING + hfa
+
+    # Logistic conversion from projected margin to home win probability.
+    home_win_prob = 1.0 / (1.0 + np.exp(-projected_home_margin / WIN_PROB_SCALE))
+
+    if projected_home_margin >= 0:
+        pick = home_team
+        pick_prob = home_win_prob
+    else:
+        pick = away_team
+        pick_prob = 1.0 - home_win_prob
+
+    return {
+        "home": home,
+        "away": away,
+        "rating_edge": float(rating_edge),
+        "projected_home_margin": float(projected_home_margin),
+        "pick": pick,
+        "win_probability": float(pick_prob),
+    }
+
+
+prediction_columns = [
+    "Season",
+    "Game ID",
+    "Week",
+    "Start Date",
+    "Away Team",
+    "Home Team",
+    "Neutral Site",
+    "Away Current V16",
+    "Home Current V16",
+    "Away Preseason Strength",
+    "Home Preseason Strength",
+    "Preseason Weight",
+    "Away Prediction Rating",
+    "Home Prediction Rating",
+    "Rating Edge (Home-Away)",
+    "Projected Home Margin",
+    "Model Pick",
+    "Win Probability",
+    "Official Pick",
+    "Final Away Score",
+    "Final Home Score",
+    "Actual Winner",
+    "Result",
+]
+
+# Load the existing prediction ledger so old picks stay frozen.
+if os.path.exists(PREDICTIONS_FILE):
+    prediction_ledger = pd.read_csv(PREDICTIONS_FILE)
+else:
+    prediction_ledger = pd.DataFrame(columns=prediction_columns)
+
+# Normalize Game ID type for reliable matching.
+if not prediction_ledger.empty and "Game ID" in prediction_ledger.columns:
+    prediction_ledger["Game ID"] = prediction_ledger["Game ID"].astype(str)
+
+# ------------------------------------------------------------
+# Grade previously saved predictions after games are completed.
+# ------------------------------------------------------------
+completed_by_id = {}
+for _, game in df_games.iterrows():
+    game_id = str(game.get("id"))
+    completed_by_id[game_id] = game
+
+if not prediction_ledger.empty:
+    for idx, pred in prediction_ledger.iterrows():
+        game_id = str(pred.get("Game ID"))
+        if game_id not in completed_by_id:
+            continue
+
+        game = completed_by_id[game_id]
+        home_score = game.get("homePoints")
+        away_score = game.get("awayPoints")
+        if pd.isna(home_score) or pd.isna(away_score):
+            continue
+
+        home_score = float(home_score)
+        away_score = float(away_score)
+        if home_score > away_score:
+            actual_winner = game.get("homeTeam")
+        elif away_score > home_score:
+            actual_winner = game.get("awayTeam")
+        else:
+            actual_winner = "Tie"
+
+        model_pick = pred.get("Model Pick")
+        if actual_winner == "Tie":
+            result = "Push/Tie"
+        elif model_pick == actual_winner:
+            result = "Correct"
+        else:
+            result = "Incorrect"
+
+        prediction_ledger.at[idx, "Final Away Score"] = away_score
+        prediction_ledger.at[idx, "Final Home Score"] = home_score
+        prediction_ledger.at[idx, "Actual Winner"] = actual_winner
+        prediction_ledger.at[idx, "Result"] = result
+
+# ------------------------------------------------------------
+# Add NEW picks only for the next uncompleted week.
+# Official tracking begins in Week 5 by default.
+# ------------------------------------------------------------
+upcoming_games = df_all_games.copy()
+if "completed" in upcoming_games.columns:
+    upcoming_games = upcoming_games[~upcoming_games["completed"].apply(_safe_bool)].copy()
+
+# Only games where both teams have current V16 ratings can be predicted.
+upcoming_games = upcoming_games[
+    upcoming_games["homeTeam"].isin(current_rating_lookup)
+    & upcoming_games["awayTeam"].isin(current_rating_lookup)
+].copy()
+
+if not upcoming_games.empty:
+    numeric_weeks = pd.to_numeric(upcoming_games["week"], errors="coerce")
+    eligible_weeks = numeric_weeks[numeric_weeks >= PREDICTION_START_WEEK]
+
+    if eligible_weeks.notna().any():
+        next_week = int(eligible_weeks.min())
+        games_to_predict = upcoming_games[numeric_weeks == next_week].copy()
+
+        existing_ids = set(
+            prediction_ledger.get("Game ID", pd.Series(dtype=str)).astype(str)
+        )
+        new_predictions = []
+
+        for _, game in games_to_predict.iterrows():
+            game_id = str(game.get("id"))
+            if game_id in existing_ids:
+                continue
+
+            home_team = game.get("homeTeam")
+            away_team = game.get("awayTeam")
+            week = game.get("week")
+            neutral_site = _safe_bool(game.get("neutralSite"))
+
+            projection = projected_game(
+                home_team=home_team,
+                away_team=away_team,
+                neutral_site=neutral_site,
+                week=week,
+            )
+            if projection is None:
+                continue
+
+            away = projection["away"]
+            home = projection["home"]
+            prior_weight = max(
+                float(away["preseason_weight"]),
+                float(home["preseason_weight"]),
+            )
+
+            new_predictions.append({
+                "Season": SEASON,
+                "Game ID": game_id,
+                "Week": week,
+                "Start Date": game.get("startDate", ""),
+                "Away Team": away_team,
+                "Home Team": home_team,
+                "Neutral Site": neutral_site,
+                "Away Current V16": round(away["current"], 2),
+                "Home Current V16": round(home["current"], 2),
+                "Away Preseason Strength": (
+                    round(away["preseason"], 2) if pd.notna(away["preseason"]) else np.nan
+                ),
+                "Home Preseason Strength": (
+                    round(home["preseason"], 2) if pd.notna(home["preseason"]) else np.nan
+                ),
+                "Preseason Weight": round(prior_weight * 100, 1),
+                "Away Prediction Rating": round(away["prediction_rating"], 2),
+                "Home Prediction Rating": round(home["prediction_rating"], 2),
+                "Rating Edge (Home-Away)": round(projection["rating_edge"], 2),
+                "Projected Home Margin": round(projection["projected_home_margin"], 1),
+                "Model Pick": projection["pick"],
+                "Win Probability": round(projection["win_probability"] * 100, 1),
+                "Official Pick": True,
+                "Final Away Score": np.nan,
+                "Final Home Score": np.nan,
+                "Actual Winner": "",
+                "Result": "Pending",
+            })
+
+        if new_predictions:
+            prediction_ledger = pd.concat(
+                [prediction_ledger, pd.DataFrame(new_predictions)],
+                ignore_index=True,
+            )
+            print(
+                f"Added {len(new_predictions)} frozen OFFICIAL prediction(s) "
+                f"for Week {next_week}."
+            )
+            print(
+                f"Week {next_week} preseason prior weight: "
+                f"{_prior_weight_for_week(next_week) * 100:.0f}%"
+            )
+        else:
+            print("No new predictions needed; upcoming official picks are already frozen.")
+    else:
+        print(
+            f"Prediction model is in calibration mode. Official picks begin "
+            f"in Week {PREDICTION_START_WEEK}."
+        )
+else:
+    print("No upcoming games currently eligible for predictions.")
+
+# Keep a stable column order even if the file came from an older version.
+for col in prediction_columns:
+    if col not in prediction_ledger.columns:
+        prediction_ledger[col] = np.nan
+prediction_ledger = prediction_ledger[prediction_columns]
+prediction_ledger.to_csv(PREDICTIONS_FILE, index=False)
+
+# Running straight-up OFFICIAL record. Weeks before the configured start do not
+# count even if an old test ledger happens to contain them.
+week_num = pd.to_numeric(prediction_ledger["Week"], errors="coerce")
+official_mask = week_num >= PREDICTION_START_WEEK
+if "Official Pick" in prediction_ledger.columns:
+    official_values = prediction_ledger["Official Pick"].apply(_safe_bool)
+    official_mask = official_mask & official_values
+
+record_rows = prediction_ledger[
+    official_mask & prediction_ledger["Result"].isin(["Correct", "Incorrect"])
+]
+model_wins = int((record_rows["Result"] == "Correct").sum())
+model_losses = int((record_rows["Result"] == "Incorrect").sum())
+model_games = model_wins + model_losses
+model_accuracy = (100.0 * model_wins / model_games) if model_games else 0.0
+
+print(f"Saved prediction ledger to {PREDICTIONS_FILE}")
+if model_games:
+    print(
+        f"OFFICIAL model straight-up record (Week {PREDICTION_START_WEEK}+): "
+        f"{model_wins}-{model_losses} ({model_accuracy:.1f}% accuracy)"
+    )
+else:
+    print(
+        f"OFFICIAL model record begins in Week {PREDICTION_START_WEEK}; "
+        "no graded official picks yet."
+    )
+

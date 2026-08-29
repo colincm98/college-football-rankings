@@ -1,23 +1,47 @@
 import streamlit as st
 import pandas as pd
+import os
+
+# --------------------------------------------------
+# PAGE CONFIG
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="College Football 2025 Rankings",
+    page_title="College Football Rankings",
     page_icon="🏈",
     layout="wide"
+)
+
+# --------------------------------------------------
+# SEASON SELECTOR
+# --------------------------------------------------
+
+season = st.selectbox(
+    "Season",
+    [2026, 2025]
 )
 
 # --------------------------------------------------
 # LOAD DATA
 # --------------------------------------------------
 
-df = pd.read_csv("CFB_2025_CFP_Eligible_Final.csv")
+csv_file = f"CFB_{season}_CFP_Eligible_Final.csv"
+
+if not os.path.exists(csv_file):
+    st.warning(
+        f"{season} rankings are not available yet. "
+        "Showing 2025 rankings instead."
+    )
+    season = 2025
+    csv_file = "CFB_2025_CFP_Eligible_Final.csv"
+
+df = pd.read_csv(csv_file)
 
 # --------------------------------------------------
 # TITLE
 # --------------------------------------------------
 
-st.title("🏈 College Football 2025 Rankings")
+st.title(f"🏈 College Football {season} Rankings")
 
 st.write(
     "Custom college football ranking system based on record, "
@@ -84,7 +108,7 @@ table = display_df[
 
 st.dataframe(
     table,
-    use_container_width=True,
+    width="stretch",
     hide_index=True
 )
 

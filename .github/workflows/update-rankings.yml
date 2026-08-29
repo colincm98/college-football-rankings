@@ -62,7 +62,11 @@ jobs:
           if [ -f "CFB_2026_CFP_Eligible_Final.csv" ]; then
             git add CFB_2026_CFP_Eligible_Final.csv
           fi
-
+         
+          if [ -f "CFB_2026_Predictions.csv" ]; then
+             git add CFB_2026_Predictions.csv
+          fi
+          
           if git diff --cached --quiet; then
             echo "No ranking changes to commit."
           else
